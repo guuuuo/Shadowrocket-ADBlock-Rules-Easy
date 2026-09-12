@@ -1,44 +1,150 @@
-# This is a basic workflow to help you get started with Actions
-
 name: Auto-Update
 
-# Controls when the workflow will run
 on:
   schedule:
-    # 每8小时更新一次
-    - cron:  '0 */8 * * *'
+    # Run at 12:01 AM local time (Asia/Hong_Kong, UTC+8) every day, which is 16:01 UTC
+    - cron: '1 16 * * *'
   
   workflow_dispatch:
   
   push:
     branches:
-    - master
+      - master
     paths-ignore: 
       - 'README.md'
       - 'LICENSE'
 
+permissions:
+  contents: write
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+env:
+  TZ: Asia/Hong_Kong
+  SKIP_PROXY_TO_REMOVE: '192.168.0.0/16, 10.0.0.0/8'
+  BYPASS_TUN_TO_REMOVE: '192.168.0.0/16, 10.0.0.0/8, 100.64.0.0/10'
+  CUSTOM_RULES: |
+    # Tailscale Custom Rules
+    DOMAIN-SUFFIX,ts.net,TAILSCALE
+    DOMAIN-SUFFIX,amoylabs.com,TAILSCALE
+    IP-CIDR,100.64.0.0/10,TAILSCALE
+    IP-CIDR,192.168.2.0/24,TAILSCALE
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-
-      - uses: szenius/set-timezone@v1.0
+      - name: Checkout Fork
+        uses: actions/checkout@v4
         with:
-          timezoneLinux: "Asia/Hong_Kong"
+          fetch-depth: 1
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Force Sync from Upstream
+        run: |
+          # Backup our customized .github folder (including this workflow)
+          cp -r .github /tmp/github_backup
+          git remote add upstream https://github.com/nthack/Shadowrocket-ADBlock-Rules-Easy.git || true
+          git fetch upstream master --depth=1
+          git reset --hard upstream/master
+          # Restore our customized .github folder
+          rm -rf .github
+          cp -r /tmp/github_backup .github
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
       - name: Install requirements
         run: pip3 install -r factory/requirements.txt
 
+      - name: Apply Custom Rules and Edits
+        shell: python
+        run: |
+          import re
+          import os
+
+          # Read env variables
+          skip_to_remove = set(x.strip() for x in os.environ.get('SKIP_PROXY_TO_REMOVE', '').split(',') if x.strip())
+          bypass_to_remove = set(x.strip() for x in os.environ.get('BYPASS_TUN_TO_REMOVE', '').split(',') if x.strip())
+          custom_rules_raw = os.environ.get('CUSTOM_RULES', '').strip()
+
+          head_path = 'factory/template/sr_head.txt'
+          with open(head_path, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          # 1. Remove from skip-proxy
+          match_skip = re.search(r'skip-proxy\s*=\s*(.*)', content)
+          if match_skip and skip_to_remove:
+              skip_line = match_skip.group(0)
+              items = [x.strip() for x in match_skip.group(1).split(',')]
+              filtered_items = [x for x in items if x not in skip_to_remove]
+              new_skip_line = "skip-proxy = " + ", ".join(filtered_items)
+              content = content.replace(skip_line, new_skip_line)
+              print(f"Updated skip-proxy:\n  Old: {skip_line}\n  New: {new_skip_line}")
+          else:
+              print("Warning: skip-proxy not found in template or no items to remove")
+
+          # 2. Remove from bypass-tun
+          match_bypass = re.search(r'bypass-tun\s*=\s*(.*)', content)
+          if match_bypass and bypass_to_remove:
+              bypass_line = match_bypass.group(0)
+              items = [x.strip() for x in match_bypass.group(1).split(',')]
+              filtered_items = [x for x in items if x not in bypass_to_remove]
+              new_bypass_line = "bypass-tun = " + ",".join(filtered_items)
+              content = content.replace(bypass_line, new_bypass_line)
+              print(f"Updated bypass-tun:\n  Old: {bypass_line}\n  New: {new_bypass_line}")
+          else:
+              print("Warning: bypass-tun not found in template or no items to remove")
+
+          # Write updated head back
+          with open(head_path, 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          # 3. Add custom rules under the first comment block in rule templates
+          if custom_rules_raw:
+              templates = [
+                  'factory/template/sr_banlist.txt',
+                  'factory/template/sr_banlist_ad.txt',
+                  'factory/template/sr_banlist_ad_manual.txt',
+                  'factory/template/sr_banlist_manual.txt'
+              ]
+              for path in templates:
+                  if not os.path.exists(path):
+                      continue
+                  with open(path, 'r', encoding='utf-8') as f:
+                      lines = f.readlines()
+                  
+                  if len(lines) >= 4 and lines[3].strip() == '#':
+                      # Skip any blank lines immediately after the comment header block
+                      rest_idx = 4
+                      while rest_idx < len(lines) and not lines[rest_idx].strip():
+                          rest_idx += 1
+                      
+                      # Build custom lines with exactly one blank line above and below
+                      custom_lines = ['\n'] + [f"{line}\n" for line in custom_rules_raw.splitlines()] + ['\n']
+                      new_lines = lines[:4] + custom_lines + lines[rest_idx:]
+                      
+                      with open(path, 'w', encoding='utf-8') as f:
+                          f.writelines(new_lines)
+                      print(f"Successfully added custom rules to: {path}")
+                  else:
+                      print(f"Warning: Failed to match comment block header in {path}")
+          
+          print("Template modifications complete!")
+
       - name: Run auto-build.sh
         run: ./factory/auto_build.sh
 
-      
-      # Use auto add and commit
-      - uses: stefanzweifel/git-auto-commit-action@v4
-        with:
-          commit_message: Daily update
+      - name: Commit and Push changes
+        run: |
+          git add -A
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Auto-sync from upstream and apply customizations [skip ci]"
+            git push origin master --force
+          else
+            echo "No changes to commit"
+          fi
