@@ -3,6 +3,11 @@
 # 包含广告过滤manual_reject、ad
 #
 
+# Tailscale Custom Rules
+DOMAIN-SUFFIX,ts.net,TAILSCALE
+DOMAIN-SUFFIX,amoylabs.com,TAILSCALE
+IP-CIDR,100.64.0.0/10,TAILSCALE
+IP-CIDR,192.168.2.0/24,TAILSCALE
 
 {{ad}}
 {{manual_reject}}
